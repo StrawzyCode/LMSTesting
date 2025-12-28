@@ -122,7 +122,7 @@ def scalar_control(label: str,
                    key: str):
     """
     Single number_input for a scalar hyper-parameter.
-    Used for the current-season page (not the big grid search).
+    Used for the current-season page or when a knob is fixed in the grid.
     """
     return float(
         st.number_input(
@@ -516,10 +516,7 @@ def build_season_prob_components_cached(
     k_elo: float,
     home_adv: float,
 ) -> SeasonComponents:
-    """
-    Cached wrapper so we don't keep rebuilding season components when we
-    re-run the settings search with the same Elo parameters.
-    """
+    """Cached wrapper for season components."""
     return build_season_prob_components(
         season_path,
         label=label,
@@ -574,36 +571,7 @@ def apply_away_penalty(X: np.ndarray,
     return X_adj
 
 
-def perm_from_decay(X: np.ndarray,
-                    decay: float,
-                    min_pick_prob: float = 0.0,
-                    big_team_penalty: float = 0.0,
-                    big_teams: set[str] | None = None,
-                    teams: list[str] | None = None) -> list[int]:
-    """
-    Original (non-precomputed) version – kept for reference / other uses.
-    """
-    num_rounds, _ = X.shape
-    logX = np.log(np.clip(X, 1e-12, 1.0))
-
-    weights = decay ** np.arange(num_rounds)  # (num_rounds,)
-    scores = (weights[:, None] * logX).sum(axis=0)
-
-    if big_team_penalty > 0.0 and big_teams and teams:
-        for j, name in enumerate(teams):
-            if name in big_teams:
-                scores[j] -= big_team_penalty
-
-    order = list(np.argsort(-scores))
-
-    if min_pick_prob > 0.0:
-        max_probs = X.max(axis=0)
-        order = [j for j in order if max_probs[j] >= min_pick_prob]
-
-    return order
-
-
-# ---------- NEW: precomputed features for faster grid search ----------
+# ---------- Precomputed features for faster grid search ----------
 
 def precompute_X_features(X: np.ndarray,
                           teams: list[str],
@@ -633,27 +601,19 @@ def perm_from_decay_precomputed(logX: np.ndarray,
                                 min_pick_prob: float = 0.0,
                                 big_team_penalty: float = 0.0) -> list[int]:
     """
-    Same logic as perm_from_decay, but uses precomputed:
-
-      - logX       (rounds x teams)
-      - max_probs  (teams,)
-      - big_mask   (teams,) bool
+    Build a permutation using precomputed logX/max_probs/big_mask.
     """
-    num_rounds, num_teams = logX.shape
+    num_rounds, _ = logX.shape
 
-    # weights for this decay
     weights = decay ** np.arange(num_rounds)      # (rounds,)
-    scores = (weights[:, None] * logX).sum(axis=0)  # (teams,)
+    scores = (weights[:, None] * logX).sum(axis=0)
 
-    # Big-6 penalty
     if big_team_penalty > 0.0 and big_mask is not None:
         scores = scores.copy()
         scores[big_mask] -= big_team_penalty
 
-    # Order teams by descending score
     order = list(np.argsort(-scores))
 
-    # Apply minimum P(win) filter
     if min_pick_prob > 0.0:
         order = [j for j in order if max_probs[j] >= min_pick_prob]
 
@@ -667,8 +627,7 @@ def detailed_run_report(perm,
                         X_index: np.ndarray,
                         df_matches: pd.DataFrame) -> pd.DataFrame:
     """
-    Per-week report with opponents, venue, probs, actual result and survival flag
-    for a specific permutation (season+settings combo).
+    Per-week report with opponents, venue, probs, actual result and survival flag.
     """
     rows = []
     alive = True
@@ -1000,12 +959,13 @@ def main():
             This tab uses **historical season CSVs** from `data/raw` and a
             **season-only Elo + odds model** to test:
 
-            - Different `w_odds` (odds vs Elo blend) values  
+            - Different `w_odds` (odds vs Elo blend)  
             - Different `decay` (front-load strength) values  
-            - Different Elo and strategy knobs (K, home_ADV, Min P(win),
-              away penalty, Big-6 penalty)
+            - Optional ranges for K-factor, home advantage, min P(win),
+              away penalty and Big-6 penalty.
 
-            so you can hunt for the best combination.
+            For each full combination we record **how many weeks you survive**
+            in each season.
             """
         )
 
@@ -1026,10 +986,21 @@ def main():
                 st.write("-", lab, "→", season_files[lab])
             st.stop()
 
+        # Allow choosing which seasons to include (speeds things up)
+        st.subheader("📅 Seasons to include in search")
+        selected_seasons = st.multiselect(
+            "Select seasons for the grid search",
+            options=list(season_files.keys()),
+            default=list(season_files.keys()),
+        )
+        if not selected_seasons:
+            st.warning("Select at least one season.")
+            return
+
         # ---------- Quick odds-only backtest ----------
         st.subheader("⚡ Quick odds-only backtest (single season)")
         season_label = st.selectbox(
-            "Select season for quick odds-only backtest",
+            "Season for quick odds-only backtest",
             options=list(season_files.keys()),
             index=len(season_files) - 1,
         )
@@ -1085,51 +1056,33 @@ def main():
                     )
 
         st.markdown("---")
-        st.subheader("🎛 Settings search: Elo/odds blend + strategy knobs")
+        st.subheader("🎛 Settings search: grid over strategy knobs")
 
         st.markdown(
             """
-            We sweep over **ranges** of:
+            For each parameter you can choose:
 
-            - `w_odds` (odds vs Elo blend)  
-            - `decay` (front-load strength)  
-            - Elo K-factor and home advantage  
-            - Minimum P(win), away penalty, Big-6 penalty  
+            - **Scan in grid** – give a min / max / step.  
+            - **Fixed** – give a single value used for all runs.
 
-            and for each full combination, record how many weeks you'd survive in
-            each season.
-
-            Set **Min = Max** for any knob you want to hold fixed.
+            The total number of combinations grows as the product of all
+            grid sizes, so if that number gets huge the search will be slow.
             """
         )
 
-        # ---------- Advanced simulation knobs (grid ranges) ----------
-        with st.expander("Advanced simulation knobs (grid ranges)"):
-            st.markdown(
-                """
-                **Elo model knobs**
+        # ---------- Advanced simulation knobs (grid setup) ----------
+        with st.expander("Advanced simulation knobs (grid setup)"):
+            st.markdown("**Elo model knobs**")
 
-                - **K-factor** – how fast ratings react to results  
-                - **Home advantage** – extra Elo rating points for the home team.
-
-                **LMS strategy knobs**
-
-                - **Minimum P(win)** – exclude teams whose BEST game all season
-                  never reaches this threshold.  
-                - **Away penalty** – subtracts a small amount from away win
-                  probabilities before planning.  
-                - **Big-team penalty** – gently discourages using Big-6 sides
-                  (Arsenal, City, etc.) too soon.
-                """
+            # K-factor
+            scan_k = st.checkbox(
+                "Scan Elo K-factor in grid",
+                value=False,
+                key="scan_k",
             )
-
-            # Elo K-factor range
-            use_custom_k = st.checkbox(
-                "Enable custom Elo K-factor search", value=False, key="adv_k"
-            )
-            if use_custom_k:
+            if scan_k:
                 k_min, k_max, k_step = range_controls(
-                    "Elo K-factor (responsiveness)",
+                    "K_elo",
                     default_min=20.0,
                     default_max=20.0,
                     default_step=1.0,
@@ -1137,16 +1090,25 @@ def main():
                 )
                 k_values = np.arange(k_min, k_max + 1e-9, k_step)
             else:
-                k_values = np.array([20.0])
+                k_single = scalar_control(
+                    "K_elo (fixed for this run)",
+                    default=20.0,
+                    min_value=5.0,
+                    max_value=40.0,
+                    step=0.5,
+                    key="k_single",
+                )
+                k_values = np.array([k_single])
 
-            # Home advantage range
-            use_custom_home = st.checkbox(
-                "Enable custom home advantage (rating pts) search",
-                value=False, key="adv_home",
+            # Home advantage
+            scan_home = st.checkbox(
+                "Scan home advantage (rating pts) in grid",
+                value=False,
+                key="scan_home",
             )
-            if use_custom_home:
+            if scan_home:
                 home_min, home_max, home_step = range_controls(
-                    "Home advantage (rating points)",
+                    "Home advantage",
                     default_min=60.0,
                     default_max=60.0,
                     default_step=5.0,
@@ -1154,16 +1116,28 @@ def main():
                 )
                 home_adv_values = np.arange(home_min, home_max + 1e-9, home_step)
             else:
-                home_adv_values = np.array([60.0])
+                home_single = scalar_control(
+                    "Home advantage (fixed)",
+                    default=60.0,
+                    min_value=20.0,
+                    max_value=100.0,
+                    step=1.0,
+                    key="home_single",
+                )
+                home_adv_values = np.array([home_single])
 
-            # Minimum pick probability range
-            use_min_pick = st.checkbox(
-                "Enforce minimum P(win) for chosen teams (search range)",
-                value=False, key="adv_minpick",
+            st.markdown("---")
+            st.markdown("**LMS strategy knobs**")
+
+            # Minimum pick probability
+            scan_minpick = st.checkbox(
+                "Scan minimum P(win) in grid",
+                value=False,
+                key="scan_minpick",
             )
-            if use_min_pick:
+            if scan_minpick:
                 mp_min, mp_max, mp_step = range_controls(
-                    "Minimum allowed P(win) over season",
+                    "Minimum P(win)",
                     default_min=0.55,
                     default_max=0.55,
                     default_step=0.01,
@@ -1171,16 +1145,27 @@ def main():
                 )
                 min_pick_values = np.arange(mp_min, mp_max + 1e-9, mp_step)
             else:
-                min_pick_values = np.array([0.0])
+                mp_single = scalar_control(
+                    "Minimum P(win) (fixed)",
+                    default=0.55,
+                    min_value=0.50,
+                    max_value=0.80,
+                    step=0.01,
+                    key="minpick_single",
+                )
+                # 0.0 means "no constraint", so if you want 0.55 as a real
+                # constraint you HAVE to scan or keep this non-zero.
+                min_pick_values = np.array([mp_single])
 
-            # Away-game penalty range
-            use_away_pen = st.checkbox(
-                "Apply away-game penalty (search range)",
-                value=False, key="adv_away",
+            # Away penalty
+            scan_away = st.checkbox(
+                "Scan away-game penalty in grid",
+                value=False,
+                key="scan_away",
             )
-            if use_away_pen:
+            if scan_away:
                 ap_min, ap_max, ap_step = range_controls(
-                    "Away penalty (absolute probability)",
+                    "Away penalty",
                     default_min=0.02,
                     default_max=0.02,
                     default_step=0.01,
@@ -1188,16 +1173,25 @@ def main():
                 )
                 away_penalty_values = np.arange(ap_min, ap_max + 1e-9, ap_step)
             else:
-                away_penalty_values = np.array([0.0])
+                ap_single = scalar_control(
+                    "Away penalty (fixed)",
+                    default=0.00,
+                    min_value=0.0,
+                    max_value=0.10,
+                    step=0.01,
+                    key="away_single",
+                )
+                away_penalty_values = np.array([ap_single])
 
-            # Big-team penalty range
-            use_big_pen = st.checkbox(
-                "Discourage using Big 6 early (search range)",
-                value=False, key="adv_big",
+            # Big-6 penalty
+            scan_big = st.checkbox(
+                "Scan Big-6 penalty in grid",
+                value=False,
+                key="scan_big",
             )
-            if use_big_pen:
+            if scan_big:
                 bp_min, bp_max, bp_step = range_controls(
-                    "Big 6 penalty (log-score units)",
+                    "Big-6 penalty",
                     default_min=0.5,
                     default_max=0.5,
                     default_step=0.1,
@@ -1205,9 +1199,18 @@ def main():
                 )
                 big_team_penalty_values = np.arange(bp_min, bp_max + 1e-9, bp_step)
             else:
-                big_team_penalty_values = np.array([0.0])
+                bp_single = scalar_control(
+                    "Big-6 penalty (fixed)",
+                    default=0.0,
+                    min_value=0.0,
+                    max_value=2.0,
+                    step=0.1,
+                    key="big_single",
+                )
+                big_team_penalty_values = np.array([bp_single])
 
         # ---------- Grid over w_odds & decay ----------
+        st.markdown("**Core strategy grid: w_odds vs decay**")
         w_min, w_max, w_step = range_controls(
             "w_odds", default_min=0.5, default_max=0.9,
             default_step=0.1, key_prefix="wgrid_main"
@@ -1217,146 +1220,139 @@ def main():
             default_step=0.02, key_prefix="dgrid_main"
         )
 
-        if st.button("🔍 Search best settings across all seasons",
+        if st.button("🔍 Search best settings across selected seasons",
                      key="settings_search_btn"):
             w_values = np.arange(w_min, w_max + 1e-9, w_step)
             decay_values = np.arange(decay_min, decay_max + 1e-9, decay_step)
 
             if len(w_values) == 0 or len(decay_values) == 0:
                 st.error("Grids are empty – check min/max/step values.")
-            else:
-                season_labels = list(season_files.keys())
+                return
 
-                total_iters = (
-                    len(season_labels)
-                    * len(k_values)
-                    * len(home_adv_values)
-                    * len(w_values)
-                    * len(away_penalty_values)
-                    * len(min_pick_values)
-                    * len(big_team_penalty_values)
-                    * len(decay_values)
-                )
+            total_iters = (
+                len(selected_seasons)
+                * len(k_values)
+                * len(home_adv_values)
+                * len(w_values)
+                * len(away_penalty_values)
+                * len(min_pick_values)
+                * len(big_team_penalty_values)
+                * len(decay_values)
+            )
 
-                if total_iters > 200000:
-                    st.warning(
-                        f"Warning: total combinations = {total_iters:,}. "
-                        "This might be slow – consider tightening some ranges."
-                    )
+            st.info(f"Total parameter combinations in this run: **{total_iters:,}**")
 
-                rows = []
-                best_run_weeks = -1
-                best_run_info = None
+            rows = []
+            best_run_weeks = -1
+            best_run_info = None
 
-                progress = st.progress(0.0, text="Running settings grid…")
-                iter_count = 0
+            progress = st.progress(0.0, text="Running settings grid…")
+            iter_count = 0
+            # To reduce overhead, only update progress ~200 times max
+            update_every = max(1, total_iters // 200)
 
-                # ----- nested loops with precomputation for speed -----
-                for season_lab, fname in season_files.items():
-                    path = os.path.join(RAW_DIR, fname)
+            for season_lab in selected_seasons:
+                path = os.path.join(RAW_DIR, season_files[season_lab])
 
-                    for k_elo_bt in k_values:
-                        for home_adv_bt in home_adv_values:
-                            try:
-                                comps = build_season_prob_components_cached(
-                                    path,
-                                    label=season_lab,
-                                    bookie_prefix=bookie_prefix,
-                                    k_elo=float(k_elo_bt),
-                                    home_adv=float(home_adv_bt),
+                for k_elo_bt in k_values:
+                    for home_adv_bt in home_adv_values:
+                        try:
+                            comps = build_season_prob_components_cached(
+                                path,
+                                label=season_lab,
+                                bookie_prefix=bookie_prefix,
+                                k_elo=float(k_elo_bt),
+                                home_adv=float(home_adv_bt),
+                            )
+                        except Exception as e:
+                            st.warning(
+                                f"Skipping {season_lab} (K={k_elo_bt}, home={home_adv_bt}): {e}"
+                            )
+                            skip_inner = (
+                                len(w_values)
+                                * len(away_penalty_values)
+                                * len(min_pick_values)
+                                * len(big_team_penalty_values)
+                                * len(decay_values)
+                            )
+                            iter_count += skip_inner
+                            continue
+
+                        for w in w_values:
+                            X_blend = blend_X_odds_elo(
+                                comps.X_odds, comps.X_elo, float(w)
+                            )
+
+                            for away_penalty in away_penalty_values:
+                                X_use = apply_away_penalty(
+                                    X_blend,
+                                    comps.X_index,
+                                    comps.matches,
+                                    comps.teams,
+                                    float(away_penalty),
                                 )
-                            except Exception as e:
-                                st.warning(
-                                    f"Skipping {season_lab} (K={k_elo_bt}, home={home_adv_bt}): {e}"
-                                )
-                                # Skip all combinations depending on this
-                                skip_inner = (
-                                    len(w_values)
-                                    * len(away_penalty_values)
-                                    * len(min_pick_values)
-                                    * len(big_team_penalty_values)
-                                    * len(decay_values)
-                                )
-                                iter_count += skip_inner
-                                progress.progress(
-                                    min(iter_count / total_iters, 1.0),
-                                    text=f"Running settings grid… {iter_count}/{total_iters}",
-                                )
-                                continue
 
-                            for w in w_values:
-                                # Blend Elo + odds for this (season, K, home, w)
-                                X_blend = blend_X_odds_elo(
-                                    comps.X_odds, comps.X_elo, float(w)
+                                # Precompute once per (season, K, home, w, away)
+                                logX, max_probs, big_mask = precompute_X_features(
+                                    X_use,
+                                    comps.teams,
+                                    BIG6_TEAMS if np.any(big_team_penalty_values > 0) else None,
                                 )
 
-                                for away_penalty in away_penalty_values:
-                                    # Apply away penalty once per (season, K, home, w, away)
-                                    X_use = apply_away_penalty(
-                                        X_blend,
-                                        comps.X_index,
-                                        comps.matches,
-                                        comps.teams,
-                                        float(away_penalty),
-                                    )
+                                for min_pick_prob in min_pick_values:
+                                    for big_team_penalty in big_team_penalty_values:
+                                        for d in decay_values:
+                                            perm = perm_from_decay_precomputed(
+                                                logX,
+                                                max_probs,
+                                                big_mask if big_team_penalty > 0 else None,
+                                                float(d),
+                                                min_pick_prob=float(min_pick_prob),
+                                                big_team_penalty=float(big_team_penalty),
+                                            )
+                                            weeks = survival_from_perm(
+                                                perm, comps.R
+                                            )
 
-                                    # Precompute logs / max probs for this X_use
-                                    logX, max_probs, big_mask = precompute_X_features(
-                                        X_use,
-                                        comps.teams,
-                                        BIG6_TEAMS if np.any(big_team_penalty_values > 0) else None,
-                                    )
-
-                                    for min_pick_prob in min_pick_values:
-                                        for big_team_penalty in big_team_penalty_values:
-                                            for d in decay_values:
-                                                perm = perm_from_decay_precomputed(
-                                                    logX,
-                                                    max_probs,
-                                                    big_mask if big_team_penalty > 0 else None,
-                                                    float(d),
-                                                    min_pick_prob=float(min_pick_prob),
-                                                    big_team_penalty=float(big_team_penalty),
+                                            rows.append(
+                                                dict(
+                                                    Season=season_lab,
+                                                    w_odds=float(w),
+                                                    Decay=float(d),
+                                                    K_elo=float(k_elo_bt),
+                                                    HomeAdv=float(home_adv_bt),
+                                                    MinPick=float(min_pick_prob),
+                                                    AwayPenalty=float(away_penalty),
+                                                    Big6Penalty=float(big_team_penalty),
+                                                    WeeksSurvived=int(weeks),
                                                 )
-                                                weeks = survival_from_perm(
-                                                    perm, comps.R
+                                            )
+
+                                            if weeks > best_run_weeks:
+                                                best_run_weeks = weeks
+                                                best_run_info = dict(
+                                                    Season=season_lab,
+                                                    w_odds=float(w),
+                                                    Decay=float(d),
+                                                    K_elo=float(k_elo_bt),
+                                                    HomeAdv=float(home_adv_bt),
+                                                    MinPick=float(min_pick_prob),
+                                                    AwayPenalty=float(away_penalty),
+                                                    Big6Penalty=float(big_team_penalty),
+                                                    Weeks=int(weeks),
+                                                    Perm=perm,
+                                                    X_used=X_use,
+                                                    R=comps.R,
+                                                    Teams=comps.teams,
+                                                    X_index=comps.X_index,
+                                                    Matches=comps.matches,
                                                 )
 
-                                                rows.append(
-                                                    dict(
-                                                        Season=season_lab,
-                                                        w_odds=float(w),
-                                                        Decay=float(d),
-                                                        K_elo=float(k_elo_bt),
-                                                        HomeAdv=float(home_adv_bt),
-                                                        MinPick=float(min_pick_prob),
-                                                        AwayPenalty=float(away_penalty),
-                                                        Big6Penalty=float(big_team_penalty),
-                                                        WeeksSurvived=int(weeks),
-                                                    )
-                                                )
-
-                                                if weeks > best_run_weeks:
-                                                    best_run_weeks = weeks
-                                                    best_run_info = dict(
-                                                        Season=season_lab,
-                                                        w_odds=float(w),
-                                                        Decay=float(d),
-                                                        K_elo=float(k_elo_bt),
-                                                        HomeAdv=float(home_adv_bt),
-                                                        MinPick=float(min_pick_prob),
-                                                        AwayPenalty=float(away_penalty),
-                                                        Big6Penalty=float(big_team_penalty),
-                                                        Weeks=int(weeks),
-                                                        Perm=perm,
-                                                        X_used=X_use,
-                                                        R=comps.R,
-                                                        Teams=comps.teams,
-                                                        X_index=comps.X_index,
-                                                        Matches=comps.matches,
-                                                    )
-
-                                                iter_count += 1
+                                            iter_count += 1
+                                            if (
+                                                iter_count % update_every == 0
+                                                or iter_count == total_iters
+                                            ):
                                                 progress.progress(
                                                     min(iter_count / total_iters, 1.0),
                                                     text=(
@@ -1365,178 +1361,176 @@ def main():
                                                     ),
                                                 )
 
-                progress.progress(1.0, text="Settings grid complete ✅")
+            progress.progress(1.0, text="Settings grid complete ✅")
 
-                results_df = pd.DataFrame(rows)
-                if results_df.empty:
-                    st.error("No results computed – something went wrong.")
-                else:
-                    colL, colR = st.columns([2, 1])
+            results_df = pd.DataFrame(rows)
+            if results_df.empty:
+                st.error("No results computed – something went wrong.")
+                return
 
-                    with colL:
-                        show_df_with_download(
-                            results_df,
-                            "Settings grid (all seasons, all knobs)",
-                            "lms_settings_grid_all_seasons_full.csv",
-                            key="settings_grid_csv",
-                        )
+            colL, colR = st.columns([2, 1])
 
-                        best_per_season = (
-                            results_df.sort_values(
-                                ["Season", "WeeksSurvived"],
-                                ascending=[True, False],
-                            )
-                            .groupby("Season")
-                            .head(1)
-                            .reset_index(drop=True)
-                        )
-                        show_df_with_download(
-                            best_per_season,
-                            "🏅 Best settings per season",
-                            "lms_best_settings_per_season.csv",
-                            key="best_per_season_csv",
-                        )
+            with colL:
+                show_df_with_download(
+                    results_df,
+                    "Settings grid (all seasons, all knobs)",
+                    "lms_settings_grid_all_seasons_full.csv",
+                    key="settings_grid_csv",
+                )
 
-                        # Best overall by *full* parameter combo
-                        avg_over_seasons_full = (
-                            results_df.groupby(
-                                [
-                                    "w_odds",
-                                    "Decay",
-                                    "K_elo",
-                                    "HomeAdv",
-                                    "MinPick",
-                                    "AwayPenalty",
-                                    "Big6Penalty",
-                                ]
-                            )["WeeksSurvived"]
-                            .mean()
-                            .reset_index(name="MeanWeeksAcrossSeasons")
-                        )
-                        best_overall = avg_over_seasons_full.loc[
-                            avg_over_seasons_full["MeanWeeksAcrossSeasons"].idxmax()
+                best_per_season = (
+                    results_df.sort_values(
+                        ["Season", "WeeksSurvived"],
+                        ascending=[True, False],
+                    )
+                    .groupby("Season")
+                    .head(1)
+                    .reset_index(drop=True)
+                )
+                show_df_with_download(
+                    best_per_season,
+                    "🏅 Best settings per season",
+                    "lms_best_settings_per_season.csv",
+                    key="best_per_season_csv",
+                )
+
+                # Best overall by *full* parameter combo
+                avg_over_seasons_full = (
+                    results_df.groupby(
+                        [
+                            "w_odds",
+                            "Decay",
+                            "K_elo",
+                            "HomeAdv",
+                            "MinPick",
+                            "AwayPenalty",
+                            "Big6Penalty",
                         ]
+                    )["WeeksSurvived"]
+                    .mean()
+                    .reset_index(name="MeanWeeksAcrossSeasons")
+                )
+                best_overall = avg_over_seasons_full.loc[
+                    avg_over_seasons_full["MeanWeeksAcrossSeasons"].idxmax()
+                ]
 
-                        st.subheader("🌍 Best settings by average survival (full combo)")
-                        st.success(
-                            "Best overall:\n"
-                            f"- **w_odds** = {best_overall['w_odds']:.2f}\n"
-                            f"- **decay** = {best_overall['Decay']:.3f}\n"
-                            f"- **K_elo** = {best_overall['K_elo']:.1f}\n"
-                            f"- **HomeAdv** = {best_overall['HomeAdv']:.1f}\n"
-                            f"- **MinPick** = {best_overall['MinPick']:.3f}\n"
-                            f"- **AwayPenalty** = {best_overall['AwayPenalty']:.3f}\n"
-                            f"- **Big6Penalty** = {best_overall['Big6Penalty']:.3f}\n"
-                            f"- **Mean survival** = "
-                            f"**{best_overall['MeanWeeksAcrossSeasons']:.2f} weeks**"
+                st.subheader("🌍 Best settings by average survival (full combo)")
+                st.success(
+                    "Best overall:\n"
+                    f"- **w_odds** = {best_overall['w_odds']:.2f}\n"
+                    f"- **decay** = {best_overall['Decay']:.3f}\n"
+                    f"- **K_elo** = {best_overall['K_elo']:.1f}\n"
+                    f"- **HomeAdv** = {best_overall['HomeAdv']:.1f}\n"
+                    f"- **MinPick** = {best_overall['MinPick']:.3f}\n"
+                    f"- **AwayPenalty** = {best_overall['AwayPenalty']:.3f}\n"
+                    f"- **Big6Penalty** = {best_overall['Big6Penalty']:.3f}\n"
+                    f"- **Mean survival** = "
+                    f"**{best_overall['MeanWeeksAcrossSeasons']:.2f} weeks**"
+                )
+
+                # Heatmap of mean survival vs w_odds & decay (averaged over other knobs)
+                st.subheader("🔥 Mean survival heatmap (averaged over other knobs)")
+
+                avg_over_seasons_wd = (
+                    results_df.groupby(["w_odds", "Decay"])["WeeksSurvived"]
+                    .mean()
+                    .reset_index(name="MeanWeeksAcrossSeasons")
+                )
+
+                pivot = avg_over_seasons_wd.pivot(
+                    index="Decay", columns="w_odds",
+                    values="MeanWeeksAcrossSeasons"
+                )
+
+                fig, ax = plt.subplots(figsize=(7, 5))
+                cax = ax.imshow(
+                    pivot.values,
+                    aspect="auto",
+                    origin="lower",
+                )
+
+                num_x = len(pivot.columns)
+                num_y = len(pivot.index)
+
+                x_tick_step = max(1, num_x // 8)
+                y_tick_step = max(1, num_y // 8)
+
+                x_ticks = np.arange(0, num_x, x_tick_step)
+                y_ticks = np.arange(0, num_y, y_tick_step)
+
+                ax.set_xticks(x_ticks)
+                ax.set_xticklabels(
+                    [f"{pivot.columns[i]:.2f}" for i in x_ticks],
+                    rotation=45,
+                    ha="right",
+                )
+
+                ax.set_yticks(y_ticks)
+                ax.set_yticklabels(
+                    [f"{pivot.index[i]:.2f}" for i in y_ticks]
+                )
+
+                ax.set_xlabel("w_odds")
+                ax.set_ylabel("decay")
+
+                fig.colorbar(cax, ax=ax, label="Mean weeks survived")
+                fig.tight_layout()
+                st.pyplot(fig)
+
+            with colR:
+                st.subheader("🏆 Longest single run of all time")
+                if best_run_info is None:
+                    st.info("No valid runs found.")
+                else:
+                    st.markdown(
+                        f"**Season:** {best_run_info['Season']}  \n"
+                        f"**w_odds:** {best_run_info['w_odds']:.2f}  \n"
+                        f"**decay:** {best_run_info['Decay']:.3f}  \n"
+                        f"**K_elo:** {best_run_info['K_elo']:.1f}  \n"
+                        f"**HomeAdv:** {best_run_info['HomeAdv']:.1f}  \n"
+                        f"**MinPick:** {best_run_info['MinPick']:.3f}  \n"
+                        f"**AwayPenalty:** {best_run_info['AwayPenalty']:.3f}  \n"
+                        f"**Big6Penalty:** {best_run_info['Big6Penalty']:.3f}  \n"
+                        f"**Weeks survived:** {best_run_info['Weeks']}"
+                    )
+
+                    run_df = detailed_run_report(
+                        best_run_info["Perm"],
+                        best_run_info["X_used"],
+                        best_run_info["R"],
+                        best_run_info["Teams"],
+                        best_run_info["X_index"],
+                        best_run_info["Matches"],
+                    )
+
+                    if run_df.empty:
+                        st.info("Could not build detailed run report.")
+                    else:
+                        p_prod = float(run_df["P_win_model"].prod())
+                        p_avg = float(run_df["P_win_model"].mean())
+                        home_rate = float(
+                            (run_df["Venue"] == "H").mean()
+                        )
+                        big6_picks = run_df["Pick"].isin(BIG6_TEAMS).sum()
+
+                        st.metric(
+                            "Overall survival proxy (product of probs)",
+                            f"{p_prod:.4f}",
+                        )
+                        st.metric(
+                            "Average P(win) of picks",
+                            f"{p_avg:.3f}",
+                        )
+                        st.metric(
+                            "% picks at home",
+                            f"{home_rate*100:.1f}%",
+                        )
+                        st.metric(
+                            "Big 6 picks",
+                            str(big6_picks),
                         )
 
-                        # Heatmap of mean survival vs w_odds & decay
-                        st.subheader("🔥 Mean survival heatmap (averaged over other knobs)")
-
-                        avg_over_seasons_wd = (
-                            results_df.groupby(["w_odds", "Decay"])["WeeksSurvived"]
-                            .mean()
-                            .reset_index(name="MeanWeeksAcrossSeasons")
-                        )
-
-                        pivot = avg_over_seasons_wd.pivot(
-                            index="Decay", columns="w_odds",
-                            values="MeanWeeksAcrossSeasons"
-                        )
-
-                        fig, ax = plt.subplots(figsize=(7, 5))
-                        cax = ax.imshow(
-                            pivot.values,
-                            aspect="auto",
-                            origin="lower",
-                        )
-
-                        # Only label a subset of ticks to avoid stacking
-                        num_x = len(pivot.columns)
-                        num_y = len(pivot.index)
-
-                        x_tick_step = max(1, num_x // 8)   # ~8 x-ticks
-                        y_tick_step = max(1, num_y // 8)   # ~8 y-ticks
-
-                        x_ticks = np.arange(0, num_x, x_tick_step)
-                        y_ticks = np.arange(0, num_y, y_tick_step)
-
-                        ax.set_xticks(x_ticks)
-                        ax.set_xticklabels(
-                            [f"{pivot.columns[i]:.2f}" for i in x_ticks],
-                            rotation=45,
-                            ha="right",
-                        )
-
-                        ax.set_yticks(y_ticks)
-                        ax.set_yticklabels(
-                            [f"{pivot.index[i]:.2f}" for i in y_ticks]
-                        )
-
-                        ax.set_xlabel("w_odds")
-                        ax.set_ylabel("decay")
-
-                        fig.colorbar(cax, ax=ax, label="Mean weeks survived")
-                        fig.tight_layout()
-                        st.pyplot(fig)
-
-                    with colR:
-                        st.subheader("🏆 Longest single run of all time")
-                        if best_run_info is None:
-                            st.info("No valid runs found.")
-                        else:
-                            st.markdown(
-                                f"**Season:** {best_run_info['Season']}  \n"
-                                f"**w_odds:** {best_run_info['w_odds']:.2f}  \n"
-                                f"**decay:** {best_run_info['Decay']:.3f}  \n"
-                                f"**K_elo:** {best_run_info['K_elo']:.1f}  \n"
-                                f"**HomeAdv:** {best_run_info['HomeAdv']:.1f}  \n"
-                                f"**MinPick:** {best_run_info['MinPick']:.3f}  \n"
-                                f"**AwayPenalty:** {best_run_info['AwayPenalty']:.3f}  \n"
-                                f"**Big6Penalty:** {best_run_info['Big6Penalty']:.3f}  \n"
-                                f"**Weeks survived:** {best_run_info['Weeks']}"
-                            )
-
-                            run_df = detailed_run_report(
-                                best_run_info["Perm"],
-                                best_run_info["X_used"],
-                                best_run_info["R"],
-                                best_run_info["Teams"],
-                                best_run_info["X_index"],
-                                best_run_info["Matches"],
-                            )
-
-                            if run_df.empty:
-                                st.info("Could not build detailed run report.")
-                            else:
-                                # Extra stats
-                                p_prod = float(run_df["P_win_model"].prod())
-                                p_avg = float(run_df["P_win_model"].mean())
-                                home_rate = float(
-                                    (run_df["Venue"] == "H").mean()
-                                )
-                                big6_picks = run_df["Pick"].isin(BIG6_TEAMS).sum()
-
-                                st.metric(
-                                    "Overall survival proxy "
-                                    "(product of probs)",
-                                    f"{p_prod:.4f}",
-                                )
-                                st.metric(
-                                    "Average P(win) of picks",
-                                    f"{p_avg:.3f}",
-                                )
-                                st.metric(
-                                    "% picks at home",
-                                    f"{home_rate*100:.1f}%",
-                                )
-                                st.metric(
-                                    "Big 6 picks",
-                                    str(big6_picks),
-                                )
-
-                                st.dataframe(run_df)
+                        st.dataframe(run_df)
 
 
 if __name__ == "__main__":
