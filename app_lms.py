@@ -581,17 +581,7 @@ def perm_from_decay(X: np.ndarray,
                     big_teams: set[str] | None = None,
                     teams: list[str] | None = None) -> list[int]:
     """
-    Build a season-long permutation of teams based on a 'front-load strength' decay.
-
-    For each team j, define a score:
-
-        score_j = sum_i [ (decay**i) * log P_ij ]
-
-    Then:
-
-      - Optionally subtract a penalty from Big 6 teams (encourages saving them)
-      - Optionally drop teams whose max P(win) over the season is below
-        `min_pick_prob`.
+    Original (non-precomputed) version – kept for reference / other uses.
     """
     num_rounds, _ = X.shape
     logX = np.log(np.clip(X, 1e-12, 1.0))
@@ -608,6 +598,63 @@ def perm_from_decay(X: np.ndarray,
 
     if min_pick_prob > 0.0:
         max_probs = X.max(axis=0)
+        order = [j for j in order if max_probs[j] >= min_pick_prob]
+
+    return order
+
+
+# ---------- NEW: precomputed features for faster grid search ----------
+
+def precompute_X_features(X: np.ndarray,
+                          teams: list[str],
+                          big_teams: set[str] | None = None):
+    """
+    Precompute log-probs, team max probs, and (optionally) a Big-6 mask
+    for a given X matrix.
+    """
+    X_clipped = np.clip(X, 1e-12, 1.0)
+    logX = np.log(X_clipped)                 # (rounds, teams)
+    max_probs = X_clipped.max(axis=0)        # (teams,)
+
+    if big_teams is not None:
+        big_mask = np.array(
+            [name in big_teams for name in teams], dtype=bool
+        )
+    else:
+        big_mask = None
+
+    return logX, max_probs, big_mask
+
+
+def perm_from_decay_precomputed(logX: np.ndarray,
+                                max_probs: np.ndarray,
+                                big_mask: np.ndarray | None,
+                                decay: float,
+                                min_pick_prob: float = 0.0,
+                                big_team_penalty: float = 0.0) -> list[int]:
+    """
+    Same logic as perm_from_decay, but uses precomputed:
+
+      - logX       (rounds x teams)
+      - max_probs  (teams,)
+      - big_mask   (teams,) bool
+    """
+    num_rounds, num_teams = logX.shape
+
+    # weights for this decay
+    weights = decay ** np.arange(num_rounds)      # (rounds,)
+    scores = (weights[:, None] * logX).sum(axis=0)  # (teams,)
+
+    # Big-6 penalty
+    if big_team_penalty > 0.0 and big_mask is not None:
+        scores = scores.copy()
+        scores[big_mask] -= big_team_penalty
+
+    # Order teams by descending score
+    order = list(np.argsort(-scores))
+
+    # Apply minimum P(win) filter
+    if min_pick_prob > 0.0:
         order = [j for j in order if max_probs[j] >= min_pick_prob]
 
     return order
@@ -765,7 +812,7 @@ def main():
                 k_elo_cur = scalar_control(
                     "Elo K-factor (responsiveness)",
                     default=20.0,
-                    min_value=0.0,
+                    min_value=5.0,
                     max_value=40.0,
                     step=0.5,
                     key="cur_k_input",
@@ -782,7 +829,7 @@ def main():
                 home_adv_cur = scalar_control(
                     "Home advantage (rating points)",
                     default=60.0,
-                    min_value=00.0,
+                    min_value=20.0,
                     max_value=100.0,
                     step=1.0,
                     key="cur_home_input",
@@ -806,7 +853,7 @@ def main():
             st.checkbox("Enforce minimum P(win) (sim only)", value=False, key="cur_minpick_on")
             st.number_input(
                 "Min P(win) over season (sim only)",
-                min_value=0.0,
+                min_value=0.50,
                 max_value=0.80,
                 value=0.55,
                 step=0.01,
@@ -955,8 +1002,8 @@ def main():
 
             - Different `w_odds` (odds vs Elo blend) values  
             - Different `decay` (front-load strength) values  
-            - Different Elo and strategy knobs (K, home_ADV, min P(win), away penalty,
-              Big-6 penalty)
+            - Different Elo and strategy knobs (K, home_ADV, Min P(win),
+              away penalty, Big-6 penalty)
 
             so you can hunt for the best combination.
             """
@@ -1051,10 +1098,12 @@ def main():
 
             and for each full combination, record how many weeks you'd survive in
             each season.
+
+            Set **Min = Max** for any knob you want to hold fixed.
             """
         )
 
-        # ---------- Advanced simulation knobs (apply to this search run) ----------
+        # ---------- Advanced simulation knobs (grid ranges) ----------
         with st.expander("Advanced simulation knobs (grid ranges)"):
             st.markdown(
                 """
@@ -1071,8 +1120,6 @@ def main():
                   probabilities before planning.  
                 - **Big-team penalty** – gently discourages using Big-6 sides
                   (Arsenal, City, etc.) too soon.
-
-                Set **Min = Max** if you want to fix a value rather than scan it.
                 """
             )
 
@@ -1204,6 +1251,7 @@ def main():
                 progress = st.progress(0.0, text="Running settings grid…")
                 iter_count = 0
 
+                # ----- nested loops with precomputation for speed -----
                 for season_lab, fname in season_files.items():
                     path = os.path.join(RAW_DIR, fname)
 
@@ -1221,7 +1269,7 @@ def main():
                                 st.warning(
                                     f"Skipping {season_lab} (K={k_elo_bt}, home={home_adv_bt}): {e}"
                                 )
-                                # Skip all combinations that depend on this
+                                # Skip all combinations depending on this
                                 skip_inner = (
                                     len(w_values)
                                     * len(away_penalty_values)
@@ -1237,13 +1285,13 @@ def main():
                                 continue
 
                             for w in w_values:
-                                # Blend Elo + odds for this season + K/home + w
+                                # Blend Elo + odds for this (season, K, home, w)
                                 X_blend = blend_X_odds_elo(
                                     comps.X_odds, comps.X_elo, float(w)
                                 )
 
                                 for away_penalty in away_penalty_values:
-                                    # Apply away penalty once per (season, K, home, w, away_penalty)
+                                    # Apply away penalty once per (season, K, home, w, away)
                                     X_use = apply_away_penalty(
                                         X_blend,
                                         comps.X_index,
@@ -1252,16 +1300,23 @@ def main():
                                         float(away_penalty),
                                     )
 
+                                    # Precompute logs / max probs for this X_use
+                                    logX, max_probs, big_mask = precompute_X_features(
+                                        X_use,
+                                        comps.teams,
+                                        BIG6_TEAMS if np.any(big_team_penalty_values > 0) else None,
+                                    )
+
                                     for min_pick_prob in min_pick_values:
                                         for big_team_penalty in big_team_penalty_values:
                                             for d in decay_values:
-                                                perm = perm_from_decay(
-                                                    X_use,
+                                                perm = perm_from_decay_precomputed(
+                                                    logX,
+                                                    max_probs,
+                                                    big_mask if big_team_penalty > 0 else None,
                                                     float(d),
                                                     min_pick_prob=float(min_pick_prob),
                                                     big_team_penalty=float(big_team_penalty),
-                                                    big_teams=BIG6_TEAMS if big_team_penalty > 0 else None,
-                                                    teams=comps.teams,
                                                 )
                                                 weeks = survival_from_perm(
                                                     perm, comps.R
