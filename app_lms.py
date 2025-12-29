@@ -21,7 +21,7 @@ RAW_DIR = "data/raw"
 
 # Current-season URLs
 URL_ODDS_2526 = "https://www.football-data.co.uk/mmz4281/2526/E0.csv"
-URL_FIX_2526 = "https://fixturedownload.com/download/csv/epl-2025"
+URL_FIX_2526 = "https://fixturedownload.com/download/epl-2025-GMTStandardTime.csv"
 
 # Big 6 teams (used for the "save big teams" penalty)
 BIG6_TEAMS = {
@@ -771,7 +771,7 @@ def main():
                 k_elo_cur = scalar_control(
                     "Elo K-factor (responsiveness)",
                     default=20.0,
-                    min_value=5.0,
+                    min_value=0.0,
                     max_value=40.0,
                     step=0.5,
                     key="cur_k_input",
@@ -788,7 +788,7 @@ def main():
                 home_adv_cur = scalar_control(
                     "Home advantage (rating points)",
                     default=60.0,
-                    min_value=20.0,
+                    min_value=0.0,
                     max_value=100.0,
                     step=1.0,
                     key="cur_home_input",
@@ -1093,7 +1093,7 @@ def main():
                 k_single = scalar_control(
                     "K_elo (fixed for this run)",
                     default=20.0,
-                    min_value=5.0,
+                    min_value=0.0,
                     max_value=40.0,
                     step=0.5,
                     key="k_single",
@@ -1119,7 +1119,7 @@ def main():
                 home_single = scalar_control(
                     "Home advantage (fixed)",
                     default=60.0,
-                    min_value=20.0,
+                    min_value=0.0,
                     max_value=100.0,
                     step=1.0,
                     key="home_single",
